@@ -8,6 +8,18 @@
   #?(:clj (:import java.util.regex.Pattern)
      :cljs (:require-macros [cljfmt.core :refer [read-resource]])))
 
+(defmacro dbl
+  [ms p body]
+  (if true
+    body
+    `(let [before# (System/currentTimeMillis)
+           r# ~body
+           t# (- (System/currentTimeMillis) before#)]
+       (when (< 0 ~ms t#)
+         (prn "Time Tripped: " t#)
+         (prn ~p))
+       r#)))
+
 #?(:clj (def read-resource* (comp read-string slurp io/resource)))
 #?(:clj (defmacro read-resource [path] `'~(read-resource* path)))
 
@@ -23,14 +35,41 @@
              (z/next* zloc))
       matches)))
 
+(defonce edit-all-counter (atom 0))
+(defonce edit-call (atom 0))
+(defonce indenting? (atom false))
+
 (defn- edit-all [zloc p? f]
-  (loop [zloc (if (p? zloc) (f zloc) zloc)]
-    (if-let [zloc (z/find-next zloc z/next* p?)]
-      (recur (f zloc))
-      zloc)))
+  (when (zero? @edit-all-counter) (reset! edit-call 0))
+  (swap! edit-call inc)
+  (loop [zloc (if (p? zloc) (f zloc) zloc)
+         i 1]
+    (swap! edit-all-counter inc)
+    ;; (prn "edit-all: z/find-next")
+    ;; (prn "editing:" i)
+    ;; (when (= 2 @edit-call)
+    ;;   (println "editing this node:\n" (z/node zloc)))
+    (if-let [zloc2 (z/find-next zloc z/next* p?)]
+      (do
+        ;; (println "found next zloc\n" (z/node zloc2) "\nafter\n" (z/node zloc) "\n\non cycle" @edit-all-counter)
+        ;; (throw (Exception. ""))
+        (recur (f zloc2) (inc i)))
+      (do
+        ;; (when indenting? (prn "the edit-all happened" i "loops"))
+        zloc))))
 
 (defn- transform [form zf & args]
-  (z/root (apply zf (z/edn form) args)))
+  (let [
+        ;; _ (prn "Transform: z/edn")
+        e (vary-meta (z/edn form) merge (meta form))
+
+        ;; Longest consuming part:
+        o (apply zf e args)
+        ;; _ (prn "that was transform: apply zf e args")
+
+        ;; _ (prn "Transform: z/root")
+        t (z/root o)]
+    t))
 
 (defn- surrounding? [zloc p?]
   (and (p? zloc) (or (nil? (z/left* zloc))
@@ -89,7 +128,7 @@
   (z/skip z/next* space? zloc))
 
 (defn- skip-whitespace-and-commas [zloc]
-  (z/skip z/next* #(or (space? %) (comma? %)) zloc)) 
+  (z/skip z/next* #(or (space? %) (comma? %)) zloc))
 
 (defn- skip-clojure-whitespace
   ([zloc] (skip-clojure-whitespace zloc z/next*))
@@ -100,7 +139,7 @@
     (if (z/linebreak? zloc')
       (recur (-> zloc' z/right* skip-whitespace-and-commas)
              (-> zloc' z/string count (+ newlines)))
-      (if (comment? (skip-clojure-whitespace zloc z/left*)) 
+      (if (comment? (skip-clojure-whitespace zloc z/left*))
         (inc newlines)
         newlines))))
 
@@ -134,7 +173,7 @@
 (defn- comment-next? [zloc]
   (-> zloc z/next* skip-whitespace comment?))
 
-(defn- should-indent? [zloc]
+(defn should-indent? [zloc]
   (and (line-break? zloc) (not (comment-next? zloc))))
 
 (defn- should-unindent? [zloc]
@@ -170,11 +209,12 @@
 (defn- margin [zloc]
   (-> zloc prior-line-string last-line-in-string count))
 
-(defn- whitespace [width]
+(defn whitespace [width]
   (n/whitespace-node (apply str (repeat width " "))))
 
 (defn- coll-indent [zloc]
-  (-> zloc z/leftmost* margin))
+  ;; (prn "coll-indent")
+  (dbl 5 "coll indent" (-> zloc z/leftmost* margin)))
 
 (defn- uneval? [zloc]
   (= (z/tag zloc) :uneval))
@@ -187,9 +227,10 @@
        (dec)))
 
 (defn- list-indent [zloc]
-  (if (> (index-of zloc) 1)
-    (-> zloc z/leftmost* z/right margin)
-    (coll-indent zloc)))
+  (dbl 5 "list indent"
+       (if (> (index-of zloc) 1)
+     (-> zloc z/leftmost* z/right margin)
+     (coll-indent zloc))))
 
 (def indent-size 2)
 
@@ -218,10 +259,21 @@
        (= 'ns (z/sexpr zloc))))
 
 (defn- ns-form? [zloc]
-  (some-> zloc z/down ns-token?))
+  (dbl 1 "ns form?" (some-> zloc z/down ns-token?)))
 
 (defn- find-namespace [zloc]
-  (some-> zloc top (z/find z/next ns-form?) z/down z/next z/sexpr))
+  (dbl -1 "find namespace"
+       ;; (some-> zloc top (z/find z/next ns-form?) z/down z/next z/sexpr)
+       (let [at-top (dbl 1 "1" (top zloc))
+             a2 (dbl 1 "2" (when at-top (z/find at-top z/next ns-form?)))
+             a3 (dbl 1 "3" (some-> a2 z/down z/next))
+             a4 (dbl 1 "4" (when a3 (z/sexpr a3)))]
+         a4)))
+
+(def find-namespace-memo
+  (memoize
+   (fn [zloc]
+     (some-> zloc top (z/find z/next ns-form?) z/down z/next z/sexpr))))
 
 (defn- indent-matches? [key sym]
   (if (symbol? sym)
@@ -247,23 +299,27 @@
     (symbol (get alias-map ns-str ns-str) (name possible-sym))))
 
 (defn- qualify-symbol-by-ns-form [possible-sym zloc]
-  (when-let [ns-name (find-namespace zloc)]
+  (when-let [ns-name #_(find-namespace-memo zloc) (doto (-> zloc meta :ns-name) #_(some->> (prn "the ns-name")))]
     (symbol (name ns-name) (name possible-sym))))
 
 (defn- fully-qualified-symbol [zloc alias-map]
-  (let [possible-sym (form-symbol zloc)]
+  (let [possible-sym (dbl 1 "fqs form symbol"
+                          (form-symbol zloc))]
     (if (symbol? possible-sym)
-      (or (qualify-symbol-by-alias-map possible-sym alias-map)
-          (qualify-symbol-by-ns-form possible-sym zloc))
+      (or (dbl 1 "fqs q alias"
+               (qualify-symbol-by-alias-map possible-sym alias-map))
+          (dbl -1 "fqs 1 ns"
+               (qualify-symbol-by-ns-form possible-sym zloc)))
       possible-sym)))
 
 (defn- inner-indent [zloc key depth idx alias-map]
-  (let [top (nth (iterate z/up zloc) depth)]
-    (if (and (or (indent-matches? key (fully-qualified-symbol zloc alias-map))
-                 (indent-matches? key (remove-namespace (form-symbol top))))
-             (or (nil? idx) (index-matches-top-argument? zloc depth idx)))
-      (let [zup (z/up zloc)]
-        (+ (margin zup) (indent-width zup))))))
+  (dbl -1 "inner indent"
+       (let [top (nth (iterate z/up zloc) depth)]
+     (if (and (or (indent-matches? key (fully-qualified-symbol zloc alias-map))
+                  (indent-matches? key (remove-namespace (form-symbol top))))
+              (or (nil? idx) (index-matches-top-argument? zloc depth idx)))
+       (let [zup (z/up zloc)]
+         (+ (margin zup) (indent-width zup)))))))
 
 (defn- nth-form [zloc n]
   (reduce (fn [z f] (if z (f z)))
@@ -279,19 +335,28 @@
          true)))
 
 (defn- block-indent [zloc key idx alias-map]
-  (if (or (indent-matches? key (fully-qualified-symbol zloc alias-map))
-          (indent-matches? key (remove-namespace (form-symbol zloc))))
-    (let [zloc-after-idx (some-> zloc (nth-form (inc idx)))]
-      (if (and (or (nil? zloc-after-idx) (first-form-in-line? zloc-after-idx))
-               (> (index-of zloc) idx))
-        (inner-indent zloc key 0 nil alias-map)
-        (list-indent zloc)))))
+  (dbl -1 "block indent"
+       (if (dbl -1 "block check 1"
+                (or (dbl -1 "block check 1 1"
+                         (indent-matches? key (dbl -1 "block check 1 1 fully qual"
+                                                   (fully-qualified-symbol zloc alias-map))))
+                    (dbl 1 "block check 1 2"
+                         (indent-matches? key (remove-namespace (form-symbol zloc))))))
+         (let [zloc-after-idx (some-> zloc (nth-form (inc idx)))]
+           (if (dbl 1 "block check 2"
+                    (and (or (nil? zloc-after-idx) (first-form-in-line? zloc-after-idx))
+                         (> (index-of zloc) idx)))
+             (dbl -1 "block inner indent"
+                  (inner-indent zloc key 0 nil alias-map))
+             (dbl 1 "block list indent"
+                  (list-indent zloc)))))))
 
 (def default-indents
   (merge (read-resource "cljfmt/indents/clojure.clj")
          (read-resource "cljfmt/indents/compojure.clj")
          (read-resource "cljfmt/indents/fuzzy.clj")))
 
+#_#_#_
 (defmulti ^:private indenter-fn
   (fn [sym alias-map [type & args]] type))
 
@@ -301,8 +366,26 @@
 (defmethod indenter-fn :block [sym alias-map [_ idx]]
   (fn [zloc] (block-indent zloc sym idx alias-map)))
 
+#_(defn safe-nth [coll n]
+  (when (< n (count coll))
+    (nth coll n)))
+
+(defn- indenter-fn
+  [sym alias-map args]
+  (let [a1 (get args 1)
+        a2 (get args 2)
+        type (nth args 0)]
+    (case type
+      :inner (fn [zloc] (inner-indent zloc sym a1 a2 alias-map))
+      :block (fn [zloc] (block-indent zloc sym a1 alias-map)))))
+
 (defn- make-indenter [[key opts] alias-map]
-  (apply some-fn (map (partial indenter-fn key alias-map) opts)))
+  #_(apply some-fn (map (partial indenter-fn key alias-map) opts))
+  (let [coll (mapv #(indenter-fn key alias-map %) opts)]
+    (fn [x]
+      ;; Note: this always returns the first result
+      (dbl 10 "the indenter that has been made"
+           (some #(% x) coll)))))
 
 (defn- indent-order [[key _]]
   (cond
@@ -313,10 +396,23 @@
 (defn- custom-indent [zloc indents alias-map]
   (if (empty? indents)
     (list-indent zloc)
-    (let [indenter (->> (sort-by indent-order indents)
-                        (map #(make-indenter % alias-map))
-                        (apply some-fn))]
-      (or (indenter zloc)
+    (let [
+          sorted-indenters (sort-by indent-order indents)
+          all-indenters (mapv #(make-indenter % alias-map) sorted-indenters)
+          in-num (count all-indenters)
+          indenter #_(->> (sort-by indent-order indents)
+                          (map #(make-indenter % alias-map))
+                          (apply some-fn))
+          (fn [x] (loop [i 0]
+                    (when (< i in-num)
+                      (if-some [r ((nth all-indenters i) x)]
+                        (do
+                          ;; (prn "found an indenter at" i)
+                          r)
+                        (do
+                          ;; (prn "did not find any indenter")
+                          (recur (inc i)))))) )]
+      (or (dbl -9 "indenter" (indenter zloc))
           (list-indent zloc)))))
 
 (defn- indent-amount [zloc indents alias-map]
@@ -329,18 +425,26 @@
       :else                    (coll-indent zloc))))
 
 (defn- indent-line [zloc indents alias-map]
-  (let [width (indent-amount zloc indents alias-map)]
+  (let [width (dbl -10 "amount" (indent-amount zloc indents alias-map))]
+    ;; (prn "that was indent-amount")
     (if (> width 0)
-      (z/insert-right* zloc (whitespace width))
+      (do
+        ;; (prn "indent-line: z/insert-right")
+        (z/insert-right* zloc (whitespace width)))
       zloc)))
+
+(defn with-ns-meta [form]
+  (let [n (find-namespace (z/edn form))]
+;; (prn "setting ns-name to" n)
+    (with-meta form {:ns-name n})))
 
 (defn indent
   ([form]
    (indent form default-indents))
   ([form indents]
-   (transform form edit-all should-indent? #(indent-line % indents {})))
+   (transform (with-ns-meta form) edit-all should-indent? #(indent-line % indents {})))
   ([form indents alias-map]
-   (transform form edit-all should-indent? #(indent-line % indents alias-map))))
+   (transform (with-ns-meta form) edit-all should-indent? #(indent-line % indents alias-map))))
 
 (defn- map-key? [zloc]
   (and (z/map? (z/up zloc))
@@ -371,7 +475,12 @@
   ([form indents]
    (indent (unindent form) indents))
   ([form indents alias-map]
-   (indent (unindent form) indents alias-map)))
+   ;; (prn "==== unindenting")
+   (reset! indenting? false)
+   (let [u (unindent form)]
+     ;; (prn "^ unindented ======= indenting v")
+     (reset! indenting? true)
+     (indent u indents alias-map))))
 
 (defn final? [zloc]
   (and (nil? (z/right* zloc)) (root? (z/up* zloc))))
@@ -437,7 +546,8 @@
 
 #?(:clj
    (defn- alias-map-for-form [form]
-     (when-let [require-zloc (-> form z/edn (z/find z/next ns-require-form?))]
+     (when-let [require-zloc (dbl 1 "alias map find"
+                                  (-> form z/edn (z/find z/next ns-require-form?)))]
        (->> (find-all require-zloc as-keyword?)
             (map as-zloc->alias-mapping)
             (apply merge)))))
@@ -471,3 +581,6 @@
   (fn [s]
     (let [sep (find-line-separator s)]
       (-> s normalize-newlines f (replace-newlines sep)))))
+
+(defn test-edit-all [zloc]
+  (edit-all zloc should-indent? identity))
