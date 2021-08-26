@@ -2,6 +2,7 @@
   #?(:clj (:refer-clojure :exclude [reader-conditional?]))
   (:require #?(:clj [clojure.java.io :as io])
             [clojure.string :as str]
+            [taoensso.tufte :as tufte  :refer (defnp p profiled profile defnp-)]
             [rewrite-clj.node :as n]
             [rewrite-clj.parser :as p]
             [rewrite-clj.zip :as z])
@@ -15,7 +16,7 @@
   #?(:clj  (fn [^String a ^String b] (.contains a b))
      :cljs str/includes?))
 
-#?(:clj 
+#?(:clj
    (defn- find-all [zloc p?]
      (loop [matches []
             zloc zloc]
@@ -24,10 +25,10 @@
                 (z/next* zloc))
          matches))))
 
-(defn- edit-all [zloc p? f]
+(defnp- edit-all [zloc p? f]
   (loop [zloc (if (p? zloc) (f zloc) zloc)]
     (if-let [zloc (z/find-next zloc z/next* p?)]
-      (recur (f zloc))
+      (recur (p :edit-all_f (f zloc)))
       zloc)))
 
 (defn- transform [form zf & args]
@@ -83,25 +84,25 @@
 (defn- comma? [zloc]
   (some-> zloc z/node n/comma?))
 
-(defn- line-break? [zloc]
+(defnp- line-break? [zloc]
   (or (z/linebreak? zloc) (comment? zloc)))
 
-(defn- skip-whitespace [zloc]
+(defnp- skip-whitespace [zloc]
   (z/skip z/next* space? zloc))
 
 (defn- skip-whitespace-and-commas [zloc]
-  (z/skip z/next* #(or (space? %) (comma? %)) zloc)) 
+  (z/skip z/next* #(or (space? %) (comma? %)) zloc))
 
 (defn- skip-clojure-whitespace
   ([zloc] (skip-clojure-whitespace zloc z/next*))
   ([zloc f] (z/skip f clojure-whitespace? zloc)))
 
-(defn- count-newlines [zloc]
+(defnp- count-newlines [zloc]
   (loop [zloc' zloc, newlines 0]
     (if (z/linebreak? zloc')
       (recur (-> zloc' z/right* skip-whitespace-and-commas)
              (-> zloc' z/string count (+ newlines)))
-      (if (comment? (skip-clojure-whitespace zloc z/left*)) 
+      (if (comment? (skip-clojure-whitespace zloc z/left*))
         (inc newlines)
         newlines))))
 
@@ -151,7 +152,7 @@
    :var "#'", :quote "'",  :syntax-quote "`", :unquote-splicing "~@"
    :namespaced-map "#"})
 
-(defn- prior-line-string [zloc]
+(defnp- prior-line-string [zloc]
   (loop [zloc     zloc
          worklist '()]
     (if-let [p (z/left* zloc)]
@@ -171,16 +172,16 @@
 (defn- margin [zloc]
   (-> zloc prior-line-string last-line-in-string count))
 
-(defn- whitespace [width]
+(defnp- whitespace [width]
   (n/whitespace-node (apply str (repeat width " "))))
 
-(defn- coll-indent [zloc]
+(defnp- coll-indent [zloc]
   (-> zloc z/leftmost* margin))
 
 (defn- uneval? [zloc]
   (= (z/tag zloc) :uneval))
 
-(defn- index-of [zloc]
+(defnp- index-of [zloc]
   (->> (iterate z/left zloc)
        (remove uneval?)
        (take-while identity)
@@ -189,12 +190,12 @@
 
 (defn- list-indent [zloc]
   (if (> (index-of zloc) 1)
-    (-> zloc z/leftmost* z/right margin)
+    (p :list-indent_mid (-> zloc z/leftmost* z/right margin))
     (coll-indent zloc)))
 
 (def indent-size 2)
 
-(defn- indent-width [zloc]
+(defnp- indent-width [zloc]
   (case (z/tag zloc)
     :list indent-size
     :fn   (inc indent-size)))
@@ -206,20 +207,20 @@
   (instance? #?(:clj Pattern :cljs js/RegExp) v))
 
 #?(:clj
-   (defn- top-level-form [zloc]
+   (defnp- top-level-form [zloc]
      (->> zloc
           (iterate z/up)
           (take-while (complement root?))
           last)))
 
-(defn- token? [zloc]
-  (= (z/tag zloc) :token))
+(defmacro token? [zloc]
+  `(= (p :R.token?-ztag (z/tag ~zloc)) :token))
 
-(defn- ns-token? [zloc]
+(defnp- ns-token? [zloc]
   (and (token? zloc)
        (= 'ns (z/sexpr zloc))))
 
-(defn- ns-form? [zloc]
+(defnp- ns-form? [zloc]
   (some-> zloc z/down ns-token?))
 
 (defn- indent-matches? [key sym]
@@ -228,56 +229,58 @@
       (symbol? key)  (= key sym)
       (pattern? key) (re-find key (str sym)))))
 
-(defn- token-value [zloc]
-  (if (token? zloc) (z/sexpr zloc)))
+(defmacro token-value [zloc]
+  `(when (p :-token-value_token (token? ~zloc)) (p :R.token-value_zsexpr (z/sexpr ~zloc))))
 
-(defn- reader-conditional? [zloc]
+(defnp- reader-conditional? [zloc]
   (and (reader-macro? zloc) (#{"?" "?@"} (-> zloc z/down token-value str))))
 
-(defn- form-symbol [zloc]
-  (-> zloc z/leftmost token-value))
+(defmacro form-symbol [zloc]
+  `(token-value (p :R.form-symbol_zleftmost(z/leftmost ~zloc))))
 
 (defn- index-matches-top-argument? [zloc depth idx]
   (and (> depth 0)
-       (= (inc idx) (index-of (nth (iterate z/up zloc) depth)))))
+       (= (inc idx) (index-of (p :index-matches-top-argument?_iterate
+                                 (nth (iterate z/up zloc) depth))))))
 
-(defn- qualify-symbol-by-alias-map [possible-sym alias-map]
+(defnp- qualify-symbol-by-alias-map [possible-sym alias-map]
   (when-let [ns-str (namespace possible-sym)]
     (symbol (get alias-map ns-str ns-str) (name possible-sym))))
 
-(defn- qualify-symbol-by-ns-name [possible-sym ns-name]
+(defnp- qualify-symbol-by-ns-name [possible-sym ns-name]
   (when ns-name
     (symbol (name ns-name) (name possible-sym))))
 
-(defn- fully-qualified-symbol [zloc context]
+(defnp- fully-qualified-symbol [zloc context]
   (let [possible-sym (form-symbol zloc)]
     (if (symbol? possible-sym)
       (or (qualify-symbol-by-alias-map possible-sym (:alias-map context))
           (qualify-symbol-by-ns-name possible-sym (:ns-name context)))
       possible-sym)))
 
-(defn- inner-indent [zloc key depth idx context]
-  (let [top (nth (iterate z/up zloc) depth)]
+(defnp- inner-indent [zloc key depth idx context]
+  (let [top (p :inner-indent_iterate (nth (iterate z/up zloc) depth))]
     (if (and (or (indent-matches? key (fully-qualified-symbol zloc context))
                  (indent-matches? key (remove-namespace (form-symbol top))))
              (or (nil? idx) (index-matches-top-argument? zloc depth idx)))
       (let [zup (z/up zloc)]
         (+ (margin zup) (indent-width zup))))))
 
-(defn- nth-form [zloc n]
+(defnp- nth-form [zloc n]
   (reduce (fn [z f] (if z (f z)))
           (z/leftmost zloc)
           (repeat n z/right)))
 
-(defn- first-form-in-line? [zloc]
-  (and (some? zloc)
-       (if-let [zloc (z/left* zloc)]
-         (if (space? zloc)
-           (recur zloc)
-           (or (z/linebreak? zloc) (comment? zloc)))
-         true)))
+(defnp- first-form-in-line? [zloc]
+  (loop [zloc zloc]
+    (and (some? zloc)
+        (if-let [zloc (z/left* zloc)]
+          (if (space? zloc)
+            (recur zloc)
+            (or (z/linebreak? zloc) (comment? zloc)))
+          true))))
 
-(defn- block-indent [zloc key idx context]
+(defnp- block-indent [zloc key idx context]
   (if (or (indent-matches? key (fully-qualified-symbol zloc context))
           (indent-matches? key (remove-namespace (form-symbol zloc))))
     (let [zloc-after-idx (some-> zloc (nth-form (inc idx)))]
@@ -300,25 +303,32 @@
 (defmethod indenter-fn :block [sym context [_ idx]]
   (fn [zloc] (block-indent zloc sym idx context)))
 
-(defn- make-indenter [[key opts] context]
+(defnp- make-indenter [[key opts] context]
   (apply some-fn (map (partial indenter-fn key context) opts)))
 
-(defn- indent-order [[key _]]
+#_(defn- indenter-fn2 [sym context [t & args]]
+  (case t
+    :inner (fn [zloc] (inner-indent zloc sym (nth args 0) (nth args 1 nil) context))
+    :block (fn [zloc] (block-indent zloc sym (nth args 0) context))))
+
+(defnp- indent-order [[key _]]
   (cond
     (and (symbol? key) (namespace key)) (str 0 key)
     (symbol? key) (str 1 key)
     (pattern? key) (str 2 key)))
 
-(defn- custom-indent [zloc indents context]
+(defnp- custom-indent [zloc indents context]
   (if (empty? indents)
     (list-indent zloc)
-    (let [indenter (->> (sort-by indent-order indents)
-                        (map #(make-indenter % context))
-                        (apply some-fn))]
-      (or (indenter zloc)
+    (let [indenter (p :custom-indent_make
+                      (->> #_(p :R.custom-indent_make_sort (sort-by indent-order indents))
+                           indents
+                           (map #(make-indenter % context))
+                           (apply some-fn)))]
+      (or (p :custom-indent_do (indenter zloc))
           (list-indent zloc)))))
 
-(defn- indent-amount [zloc indents context]
+(defnp- indent-amount [zloc indents context]
   (let [tag (-> zloc z/up z/tag)
         gp  (-> zloc z/up z/up)]
     (cond
@@ -327,10 +337,10 @@
       (= :meta tag)            (indent-amount (z/up zloc) indents context)
       :else                    (coll-indent zloc))))
 
-(defn- indent-line [zloc indents context]
+(defnp- indent-line [zloc indents context]
   (let [width (indent-amount zloc indents context)]
     (if (> width 0)
-      (z/insert-right* zloc (whitespace width))
+      (p :indent-line_insert-right (z/insert-right* zloc (whitespace width)))
       zloc)))
 
 (defn- find-namespace [zloc]
@@ -342,10 +352,11 @@
   ([form indents]
    (indent form indents {}))
   ([form indents alias-map]
-   (let [ns-name (find-namespace (z/edn form))]
-     (transform form edit-all should-indent? 
-                #(indent-line % indents {:alias-map alias-map 
-                                         :ns-name ns-name})))))
+   (let [ns-name (find-namespace (z/edn form))
+         sorted-indents (p :indent_sort (sort-by indent-order indents))]
+     (transform form edit-all should-indent?
+                #(indent-line % sorted-indents {:alias-map alias-map
+                                                :ns-name ns-name})))))
 
 (defn- map-key? [zloc]
   (and (z/map? (z/up zloc))
@@ -370,7 +381,7 @@
 (defn split-keypairs-over-multiple-lines [form]
   (transform form edit-all map-key-without-line-break? insert-newline-left))
 
-(defn reindent
+(defnp reindent
   ([form]
    (indent (unindent form)))
   ([form indents]
@@ -397,7 +408,7 @@
 (defn remove-multiple-non-indenting-spaces [form]
   (transform form edit-all non-indenting-whitespace? replace-with-one-space))
 
-(defn reformat-form
+(defnp reformat-form
   ([form]
    (reformat-form form {}))
   ([form opts]
@@ -451,14 +462,14 @@
   ([form-string]
    (reformat-string form-string {}))
   ([form-string options]
-   (let [parsed-form (p/parse-string-all form-string)
+   (let [parsed-form (p :R.reformat-string_parse-string (p/parse-string-all form-string))
          alias-map   #?(:clj (or (:alias-map options)
                                  (alias-map-for-form parsed-form))
-                        :cljs (:alias-map options))]
-     (-> parsed-form
-         (reformat-form (cond-> options
-                          alias-map (assoc :alias-map alias-map)))
-         (n/string)))))
+                        :cljs (:alias-map options))
+         r (-> parsed-form
+               (reformat-form (cond-> options
+                                alias-map (assoc :alias-map alias-map))))]
+     (p :R.reformat-string_str (n/string r)))))
 
 (def default-line-separator
   #?(:clj (System/lineSeparator) :cljs \newline))
